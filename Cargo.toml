@@ -1,0 +1,17 @@
+[package]
+name = "bson2csv"
+version = "0.1.0"
+edition = "2021"
+description = "Convert large BSON dump files (mongodump) to CSV with field selection and filtering"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+bson = "2.11"
+csv = "1.3"
+anyhow = "1.0"
+rayon = "1.10"
+crossbeam-channel = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,22 @@
+# Répertoires de build
+/target
+/dist
+
+# Fichiers de backup et logs
+**/*.rs.bk
+*.log
+
+# Fichiers système
+.DS_Store
+Thumbs.db
+
+# Fichiers d'éditeurs / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Variables d'environnement
+.env
+.env.local

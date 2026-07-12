@@ -1,0 +1,23 @@
+# Configuration used by `cross` (https://github.com/cross-rs/cross).
+#
+# `cross` runs the Rust toolchain inside a Docker container that already has
+# the correct C toolchain / linker for the requested target. This lets us
+# cross-compile static Linux binaries from macOS without touching the host.
+#
+# The default images shipped with cross are sufficient for the musl targets
+# used here. We pin them explicitly so builds stay reproducible.
+
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+
+[build.env]
+# Forward these variables into the build container if they are set on the
+# host. Useful for private registries / proxies. Safe to leave empty.
+passthrough = [
+    "RUST_BACKTRACE",
+    "RUST_LOG",
+    "CARGO_TERM_COLOR",
+]

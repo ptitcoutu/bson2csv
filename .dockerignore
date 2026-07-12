@@ -1,0 +1,5 @@
+# Everything is ignored except the specific target directories that hold
+# the pre-built binary. Keeps the Docker build context tiny.
+*
+!target/x86_64-unknown-linux-musl/release/bson2csv
+!target/aarch64-unknown-linux-musl/release/bson2csv

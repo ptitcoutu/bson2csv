@@ -1,0 +1,124 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            asset_name: bson2csv-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+            asset_name: bson2csv-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            asset_name: bson2csv-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+            asset_name: bson2csv-macos-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/bson2csv" "dist/${{ matrix.asset_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read crate version
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist
+
+      - name: Compute checksums
+        working-directory: dist
+        run: sha256sum bson2csv-* > SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}-${{ github.run_number }}
+          name: bson2csv v${{ steps.version.outputs.version }} (build ${{ github.run_number }})
+          body: |
+            Automated build from commit ${{ github.sha }} on `main`.
+
+            Binaries:
+            - `bson2csv-linux-amd64` (static musl)
+            - `bson2csv-linux-arm64` (static musl)
+            - `bson2csv-macos-x86_64`
+            - `bson2csv-macos-arm64`
+
+            SHA-256 checksums are in `SHA256SUMS.txt`.
+          files: |
+            dist/bson2csv-linux-amd64
+            dist/bson2csv-linux-arm64
+            dist/bson2csv-macos-x86_64
+            dist/bson2csv-macos-arm64
+            dist/SHA256SUMS.txt
+          generate_release_notes: true

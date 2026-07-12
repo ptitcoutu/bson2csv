@@ -11,7 +11,14 @@ use clap::Parser;
 use crossbeam_channel::bounded;
 use rayon::prelude::*;
 
-/// Convert a BSON dump (e.g. from mongodump) to CSV.
+mod sink;
+
+use sink::{
+    parse_field_types, ChunkSink, CsvSink, FieldType, OutputFormat, ParquetCompression,
+    ParquetSink, RotatingSink,
+};
+
+/// Convert a BSON dump (e.g. from mongodump) to CSV or Parquet.
 ///
 /// The tool streams the input file document by document and processes
 /// documents in parallel chunks (rayon) while a dedicated reader thread
@@ -20,6 +27,10 @@ use rayon::prelude::*;
 ///
 /// Nested fields are addressable with dotted notation:
 /// `user.address.city` for sub-documents, `tags.0` for array elements.
+///
+/// Output can be split into multiple chunk files with `--rows-per-file`, and
+/// a shell hook (`--upload-cmd`) can be invoked after each chunk is closed
+/// to move it to a remote bucket (GCS, S3, ...).
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -27,14 +38,35 @@ struct Cli {
     #[arg(short, long)]
     input: PathBuf,
 
-    /// Path to the output CSV file. If omitted, writes to stdout.
+    /// Path to the output file.
+    ///
+    /// When `--rows-per-file` is 0 (default), this is the single output file.
+    /// When `--rows-per-file` > 0, this is treated as a prefix and a numeric
+    /// index + extension is appended, e.g. `out` -> `out-00000.csv`.
+    ///
+    /// If omitted and the format is CSV without rotation, writes to stdout.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Csv)]
+    format: OutputFormat,
+
     /// Fields to extract, in dotted notation. Repeat the flag or use commas.
-    /// Example: -f _id -f user.name -f tags.0
+    /// An optional column alias may be given with `path=alias` (useful for
+    /// Parquet, where dots in column names confuse some tooling).
+    /// Example: -f _id -f user.name=user_name -f tags.0=first_tag
     #[arg(short = 'f', long = "field", value_delimiter = ',', required = true)]
     fields: Vec<String>,
+
+    /// Optional per-field type override, of the form `field:type`.
+    /// Supported types: `string` (default), `int32`, `int64`, `double`,
+    /// `bool`, `timestamp` (ms since epoch, UTC).
+    /// Repeatable or comma-separated. Applies to both CSV (formatting)
+    /// and Parquet (schema).
+    /// Example: --field-type user.age:int32,created_at:timestamp
+    #[arg(long = "field-type", value_delimiter = ',')]
+    field_types: Vec<String>,
 
     /// Optional filter of the form `field=value`. Only documents whose
     /// (flattened) `field` equals `value` (string comparison) are exported.
@@ -55,9 +87,30 @@ struct Cli {
     #[arg(long, default_value = ",")]
     delimiter: char,
 
-    /// Do not write the header row.
+    /// Do not write the header row (CSV only).
     #[arg(long)]
     no_header: bool,
+
+    /// Parquet compression codec.
+    #[arg(long, value_enum, default_value_t = ParquetCompression::Snappy)]
+    compression: ParquetCompression,
+
+    /// Split the output into files of at most N kept rows.
+    /// `0` disables rotation (single file, current behavior).
+    #[arg(long, default_value_t = 0)]
+    rows_per_file: u64,
+
+    /// Shell command to run after each chunk file is fully written and closed.
+    /// Placeholders: `{file}` is replaced by the chunk path, `{index}` by
+    /// the zero-padded chunk index. The command is executed via the system
+    /// shell (`sh -c` on Unix). A non-zero exit status aborts the run.
+    /// Example: --upload-cmd 'gsutil cp {file} gs://my-bucket/'
+    #[arg(long)]
+    upload_cmd: Option<String>,
+
+    /// Remove the local chunk file after `--upload-cmd` returns successfully.
+    #[arg(long)]
+    remove_after_upload: bool,
 
     /// Number of documents processed per chunk.
     /// Larger values improve throughput at the cost of RAM.
@@ -73,10 +126,11 @@ struct Cli {
     progress_every: u64,
 }
 
-/// A processed chunk ready to be written to CSV.
+/// A processed chunk ready to be written to the output sink.
 struct ProcessedChunk {
     /// Records to write (already filtered, in original order).
-    records: Vec<Vec<String>>,
+    /// Inner vec has exactly `fields.len()` typed values.
+    records: Vec<Vec<sink::TypedValue>>,
     /// Total documents read in the chunk (for stats).
     total: u64,
 }
@@ -105,21 +159,41 @@ fn main() -> Result<()> {
         .map(|s| parse_filter_in(s))
         .collect::<Result<Vec<_>>>()?;
 
-    // --- Output writer -------------------------------------------------------
-    let writer: Box<dyn Write> = match &cli.output {
-        Some(path) => {
-            let f = File::create(path)
-                .with_context(|| format!("Failed to create output file: {}", path.display()))?;
-            Box::new(BufWriter::with_capacity(8 * 1024 * 1024, f))
+    // Split `-f path[=alias]` into parallel vectors of resolution paths and
+    // display column names.
+    let (paths, column_names): (Vec<String>, Vec<String>) = cli
+        .fields
+        .iter()
+        .map(|entry| match entry.split_once('=') {
+            Some((p, a)) => (p.trim().to_string(), a.trim().to_string()),
+            None => (entry.clone(), entry.clone()),
+        })
+        .unzip();
+    for (p, a) in paths.iter().zip(column_names.iter()) {
+        if p.is_empty() || a.is_empty() {
+            anyhow::bail!("--field path/alias cannot be empty (got '{p}={a}')");
         }
-        None => Box::new(BufWriter::with_capacity(1024 * 1024, io::stdout().lock())),
-    };
-    let mut csv_writer = csv::WriterBuilder::new()
-        .delimiter(cli.delimiter as u8)
-        .from_writer(writer);
-    if !cli.no_header {
-        csv_writer.write_record(&cli.fields)?;
     }
+
+    // Field types: default String for every field, then apply overrides.
+    // `--field-type` may target either the path or the alias.
+    let field_types: Vec<FieldType> = {
+        let mut map = std::collections::HashMap::new();
+        parse_field_types(&cli.field_types, &mut map)?;
+        paths
+            .iter()
+            .zip(column_names.iter())
+            .map(|(p, a)| {
+                map.get(p)
+                    .or_else(|| map.get(a))
+                    .copied()
+                    .unwrap_or(FieldType::String)
+            })
+            .collect()
+    };
+
+    // --- Build the output sink ---------------------------------------------
+    let mut sink: Box<dyn ChunkSink> = build_sink(&cli, &column_names, &field_types)?;
 
     // --- Pipeline: reader thread -> processed chunks channel ----------------
     // Bounded channels give backpressure: at most 2 raw chunks in flight and
@@ -158,31 +232,33 @@ fn main() -> Result<()> {
 
     // Worker thread: takes raw chunks, processes them in parallel with rayon,
     // then forwards ordered records to the writer channel.
-    let fields = cli.fields.clone();
+    let paths_worker = paths.clone();
+    let field_types_worker = field_types.clone();
     let filter_clone = filter.clone();
     let set_filters_clone = set_filters.clone();
     let worker_handle = thread::spawn(move || -> Result<()> {
         while let Ok(chunk) = raw_rx.recv() {
             let total = chunk.len() as u64;
             // par_iter preserves order when collected into a Vec.
-            let records: Vec<Vec<String>> = chunk
+            let records: Vec<Vec<sink::TypedValue>> = chunk
                 .par_iter()
                 .filter_map(|doc| {
                     if let Some((ref key, ref expected)) = filter_clone {
-                        match get_flattened(doc, key) {
+                        match get_flattened_string(doc, key) {
                             Some(v) if &v == expected => {}
                             _ => return None,
                         }
                     }
                     for (key, set) in &set_filters_clone {
-                        match get_flattened(doc, key) {
+                        match get_flattened_string(doc, key) {
                             Some(v) if set.contains(&v) => {}
                             _ => return None,
                         }
                     }
-                    let mut record: Vec<String> = Vec::with_capacity(fields.len());
-                    for f in &fields {
-                        record.push(get_flattened(doc, f).unwrap_or_default());
+                    let mut record: Vec<sink::TypedValue> =
+                        Vec::with_capacity(paths_worker.len());
+                    for (p, ty) in paths_worker.iter().zip(field_types_worker.iter()) {
+                        record.push(get_flattened_typed(doc, p, *ty));
                     }
                     Some(record)
                 })
@@ -199,9 +275,7 @@ fn main() -> Result<()> {
     let mut kept: u64 = 0;
     let mut last_reported: u64 = 0;
     while let Ok(chunk) = out_rx.recv() {
-        for record in &chunk.records {
-            csv_writer.write_record(record)?;
-        }
+        sink.write_records(&chunk.records)?;
         kept += chunk.records.len() as u64;
         total += chunk.total;
 
@@ -219,9 +293,96 @@ fn main() -> Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("Worker thread panicked"))??;
 
-    csv_writer.flush()?;
+    sink.finish()?;
     eprintln!("Done. Total: {total} documents, kept: {kept}");
     Ok(())
+}
+
+/// Build the output sink from CLI options.
+fn build_sink(
+    cli: &Cli,
+    column_names: &[String],
+    field_types: &[FieldType],
+) -> Result<Box<dyn ChunkSink>> {
+    // Validate CLI combinations early with clear error messages.
+    let uses_rotation = cli.rows_per_file > 0;
+    let is_parquet = matches!(cli.format, OutputFormat::Parquet);
+
+    if is_parquet && cli.output.is_none() {
+        anyhow::bail!("--output is required with --format parquet (Parquet cannot be written to stdout)");
+    }
+    if uses_rotation && cli.output.is_none() {
+        anyhow::bail!("--output is required when --rows-per-file > 0");
+    }
+    if cli.upload_cmd.is_some() && !uses_rotation && cli.output.is_none() {
+        anyhow::bail!("--upload-cmd requires --output");
+    }
+    if cli.remove_after_upload && cli.upload_cmd.is_none() {
+        anyhow::bail!("--remove-after-upload requires --upload-cmd");
+    }
+
+    // Factory that builds a fresh underlying sink for each chunk file.
+    let columns: Vec<String> = column_names.to_vec();
+    let field_types_owned: Vec<FieldType> = field_types.to_vec();
+    let delimiter = cli.delimiter;
+    let no_header = cli.no_header;
+    let compression = cli.compression;
+    let format = cli.format;
+
+    let factory: sink::SinkFactory = Box::new(move |path: Option<&Path>| -> Result<Box<dyn ChunkSink>> {
+        match format {
+            OutputFormat::Csv => {
+                let writer: Box<dyn Write + Send> = match path {
+                    Some(p) => {
+                        let f = File::create(p)
+                            .with_context(|| format!("Failed to create output file: {}", p.display()))?;
+                        Box::new(BufWriter::with_capacity(8 * 1024 * 1024, f))
+                    }
+                    None => {
+                        // stdout::lock() is not Send; use a plain (unlocked)
+                        // stdout handle wrapped in BufWriter. The main thread
+                        // owns the sink so there is no thread contention.
+                        Box::new(BufWriter::with_capacity(1024 * 1024, io::stdout()))
+                    }
+                };
+                Ok(Box::new(CsvSink::new(writer, &columns, delimiter, no_header)?))
+            }
+            OutputFormat::Parquet => {
+                let p = path.expect("parquet requires a path (validated earlier)");
+                let f = File::create(p)
+                    .with_context(|| format!("Failed to create output file: {}", p.display()))?;
+                Ok(Box::new(ParquetSink::new(
+                    f,
+                    &columns,
+                    &field_types_owned,
+                    compression,
+                )?))
+            }
+        }
+    });
+
+    if uses_rotation {
+        let output = cli.output.clone().expect("checked above");
+        let ext = default_extension(format);
+        Ok(Box::new(RotatingSink::new(
+            output,
+            ext,
+            cli.rows_per_file,
+            factory,
+            cli.upload_cmd.clone(),
+            cli.remove_after_upload,
+        )))
+    } else {
+        // No rotation: build one underlying sink directly.
+        factory(cli.output.as_deref())
+    }
+}
+
+fn default_extension(format: OutputFormat) -> &'static str {
+    match format {
+        OutputFormat::Csv => "csv",
+        OutputFormat::Parquet => "parquet",
+    }
 }
 
 /// Parse a filter argument of the form `key=value`.
@@ -326,10 +487,8 @@ fn read_exact_or_eof<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<ReadStat
     Ok(ReadState::Ok)
 }
 
-/// Resolve a dotted path against a BSON document and stringify the resulting
-/// scalar. Returns `None` if the path does not exist.
-fn get_flattened(doc: &Document, path: &str) -> Option<String> {
-    // Walk without cloning intermediate values.
+/// Resolve a dotted path against a BSON document and return the raw BSON.
+fn get_flattened_bson<'a>(doc: &'a Document, path: &str) -> Option<&'a Bson> {
     let mut segments = path.split('.');
     let first = segments.next()?;
     let mut current: &Bson = doc.get(first)?;
@@ -343,13 +502,28 @@ fn get_flattened(doc: &Document, path: &str) -> Option<String> {
             _ => return None,
         };
     }
-    Some(bson_to_string(current))
+    Some(current)
+}
+
+/// Resolve a dotted path and stringify the resulting scalar.
+/// Used by filters (which compare strings).
+fn get_flattened_string(doc: &Document, path: &str) -> Option<String> {
+    get_flattened_bson(doc, path).map(bson_to_string)
+}
+
+/// Resolve a dotted path and coerce it to the requested typed value.
+/// Missing / null / uncoercible values become `TypedValue::Null`.
+fn get_flattened_typed(doc: &Document, path: &str, ty: FieldType) -> sink::TypedValue {
+    match get_flattened_bson(doc, path) {
+        None => sink::TypedValue::Null,
+        Some(b) => sink::coerce(b, ty),
+    }
 }
 
 /// Convert a BSON scalar into its string representation.
 /// Non-scalar values (documents, arrays) are serialized as their JSON form
 /// so the CSV cell still carries the information.
-fn bson_to_string(b: &Bson) -> String {
+pub(crate) fn bson_to_string(b: &Bson) -> String {
     match b {
         Bson::Double(v) => v.to_string(),
         Bson::String(v) => v.clone(),
@@ -373,3 +547,4 @@ fn bson_to_string(b: &Bson) -> String {
         Bson::Document(_) | Bson::Array(_) => b.to_string(),
     }
 }
+
